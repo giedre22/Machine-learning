@@ -1,0 +1,126 @@
+WITH windows AS (
+  SELECT 'NewYear' AS family,       DATE '2021-01-27' AS start_date, DATE '2021-01-31' AS end_date, 1 AS prio UNION ALL
+  SELECT 'Holiday',                  DATE '2020-12-10',              DATE '2021-01-05',              2 UNION ALL
+  SELECT 'BlackFriday',              DATE '2020-11-27',              DATE '2021-01-29',              3 UNION ALL
+  SELECT 'Data Share Promo',         DATE '2020-11-01',              DATE '2021-01-31',              4
+),
+
+base AS (
+  SELECT
+    COALESCE(user_id, user_pseudo_id) AS user_key,
+    TIMESTAMP_MICROS(event_timestamp) AS event_ts,
+    LOWER(TRIM(campaign)) AS campaign_raw,
+    REGEXP_REPLACE(LOWER(TRIM(campaign)), r'[\s_\-]+', '') AS campaign_compact,
+    event_name
+  FROM `turing_data_analytics.raw_events`
+  WHERE user_pseudo_id IS NOT NULL
+),
+
+labeled_variants AS (
+  SELECT
+    user_key, event_ts, event_name,
+    CASE
+      WHEN REGEXP_CONTAINS(campaign_compact, r'blackfridayv1') THEN 'BlackFriday_V1'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'blackfridayv2') THEN 'BlackFriday_V2'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'holidayv1')     THEN 'Holiday_V1'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'holidayv2')     THEN 'Holiday_V2'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'newyearv1')     THEN 'NewYear_V1'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'newyearv2')     THEN 'NewYear_V2'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'datasharepromo') THEN 'Data Share Promo'
+      ELSE NULL
+    END AS campaign_variant
+  FROM base
+  WHERE campaign_raw IS NOT NULL AND campaign_raw <> ''
+),
+
+unattributed_inferred AS (
+  SELECT
+    b.user_key, b.event_ts, b.event_name, w.family
+  FROM base b
+  JOIN windows w
+    ON (b.campaign_raw IS NULL OR b.campaign_raw = '' OR b.campaign_raw = '(unattributed)')
+   AND DATE(b.event_ts) BETWEEN w.start_date AND w.end_date
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY b.user_key, b.event_ts ORDER BY w.prio) = 1
+),
+
+unattributed_rest AS (
+  SELECT b.user_key, b.event_ts, b.event_name, '(unattributed)' AS campaign_label
+  FROM base b
+  WHERE (b.campaign_raw IS NULL OR b.campaign_raw = '' OR b.campaign_raw = '(unattributed)')
+    AND NOT EXISTS (
+      SELECT 1 FROM windows w
+      WHERE DATE(b.event_ts) BETWEEN w.start_date AND w.end_date
+    )
+),
+presented_events AS (
+  SELECT user_key, event_ts, event_name, campaign_variant AS campaign_presented
+  FROM labeled_variants
+  WHERE campaign_variant IS NOT NULL
+  UNION ALL
+  SELECT user_key, event_ts, event_name, family AS campaign_presented
+  FROM unattributed_inferred
+  UNION ALL
+  SELECT user_key, event_ts, event_name, campaign_label AS campaign_presented
+  FROM unattributed_rest
+),
+-- Sessionize (30-min inactivity)
+ordered AS (
+  SELECT
+    user_key,
+    campaign_presented AS campaign,
+    event_name,
+    event_ts,
+    LAG(event_ts) OVER (PARTITION BY user_key ORDER BY event_ts) AS prev_ts
+  FROM presented_events
+),
+marked AS (
+  SELECT
+    *,
+    IF(prev_ts IS NULL OR TIMESTAMP_DIFF(event_ts, prev_ts, MINUTE) > 30, 1, 0) AS is_new_session
+  FROM ordered
+),
+sessions AS (
+  SELECT
+    user_key,
+    campaign,
+    event_name,
+    event_ts,
+    SUM(is_new_session) OVER (
+      PARTITION BY user_key
+      ORDER BY event_ts
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS session_id
+  FROM marked
+),
+
+-- Engagement levels per session
+session_engagement AS (
+  SELECT
+    user_key,
+    campaign,
+    session_id,
+    MIN(event_ts) AS session_start,
+    FORMAT_DATE('%A', DATE(MIN(event_ts))) AS weekday,
+    CAST(FORMAT_TIMESTAMP('%u', MIN(event_ts)) AS INT64) AS weekday_iso_num, -- 1=Mon..7=Sun (ISO)
+    CASE
+      WHEN COUNTIF(event_name = 'purchase') > 0 THEN '5_Conversion'
+      WHEN COUNTIF(event_name IN ('add_shipping_info','add_payment_info')) > 0 THEN '4_Checkout'
+      WHEN COUNTIF(event_name IN ('add_to_cart','begin_checkout')) > 0 THEN '3_Shopping_Intent'
+      WHEN COUNTIF(event_name IN ('view_item','view_search_results','user_engagement','click','select_item')) > 0 THEN '2_Browsing'
+      WHEN COUNTIF(event_name IN ('first_visit','session_start','page_view','scroll','view_item_list','view_promotion','select_promotion')) > 0 THEN '1_Visit'
+      ELSE '0_Other'
+    END AS engagement_level
+  FROM sessions
+  GROUP BY user_key, campaign, session_id
+)
+
+-- Aggregate: weekday × presented campaign × engagement bucket
+SELECT
+  campaign,
+  weekday,
+  engagement_level,
+  COUNT(DISTINCT user_key) AS users,
+  COUNT(DISTINCT CONCAT(user_key, '-', CAST(session_id AS STRING))) AS sessions
+FROM session_engagement
+GROUP BY campaign, weekday, engagement_level, weekday_iso_num
+ORDER BY campaign, weekday_iso_num, engagement_level;

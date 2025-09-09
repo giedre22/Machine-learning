@@ -1,0 +1,94 @@
+WITH windows AS (
+  SELECT 'NewYear' AS family,        DATE '2021-01-27' AS start_date, DATE '2021-01-31' AS end_date, 1 AS prio UNION ALL
+  SELECT 'Holiday',                   DATE '2020-12-10',              DATE '2021-01-05',              2 UNION ALL
+  SELECT 'BlackFriday',               DATE '2020-11-27',              DATE '2021-01-29',              3 UNION ALL
+  SELECT 'Data Share Promo',          DATE '2020-11-01',              DATE '2021-01-31',              4
+),
+
+base AS (
+  SELECT
+    COALESCE(user_id, user_pseudo_id) AS user_key,
+    TIMESTAMP_MICROS(event_timestamp) AS event_ts,
+    DATE(TIMESTAMP_MICROS(event_timestamp)) AS event_date,
+    LOWER(TRIM(campaign)) AS campaign_raw,
+    REGEXP_REPLACE(LOWER(TRIM(campaign)), r'[\s_\-]+', '') AS campaign_compact,
+    -- normalize device + browser
+    LOWER(TRIM(COALESCE(category, '(unknown_device)'))) AS device_type,
+    LOWER(TRIM(COALESCE(browser,  '(unknown_browser)'))) AS browser,
+    event_name
+  FROM `turing_data_analytics.raw_events`
+  WHERE user_pseudo_id IS NOT NULL
+),
+
+labeled AS (
+  SELECT
+    user_key, event_ts, event_date, event_name, device_type, browser,
+    CASE
+      WHEN REGEXP_CONTAINS(campaign_compact, r'blackfridayv[12]') THEN 'BlackFriday'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'holidayv[12]')     THEN 'Holiday'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'newyearv[12]')     THEN 'NewYear'
+      WHEN REGEXP_CONTAINS(campaign_compact, r'datasharepromo')   THEN 'Data Share Promo'
+      ELSE NULL
+    END AS family
+  FROM base
+  WHERE campaign_raw IS NOT NULL AND campaign_raw <> ''
+),
+unattributed AS (
+  SELECT
+    u.user_key, u.event_ts, u.event_date, u.event_name, u.device_type, u.browser, w.family
+  FROM base u
+  JOIN windows w
+    ON (u.campaign_raw IS NULL OR u.campaign_raw = '' OR u.campaign_raw = '(unattributed)')
+   AND u.event_date BETWEEN w.start_date AND w.end_date
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY u.user_key, u.event_ts ORDER BY w.prio) = 1
+),
+combined_events AS (
+  SELECT user_key, event_ts, event_date, event_name, device_type, browser, family AS campaign_family
+  FROM labeled
+  WHERE family IS NOT NULL
+  UNION ALL
+  SELECT user_key, event_ts, event_date, event_name, device_type, browser, family AS campaign_family
+  FROM unattributed
+),
+with_weeks AS (
+  SELECT
+    user_key,
+    event_ts,
+    event_date,
+    DATE_TRUNC(event_date, ISOWEEK) AS week_start,
+    campaign_family,
+    device_type,
+    browser,
+    event_name
+  FROM combined_events
+),
+
+-- Aggregate (keep week_start to sort properly)
+agg AS (
+  SELECT
+    campaign_family AS campaign,
+    week_start,
+    device_type,
+    browser,
+    CAST(FORMAT_TIMESTAMP('%u', event_ts) AS INT64) AS weekday_iso_num,
+    FORMAT_TIMESTAMP('%A', event_ts) AS weekday_name,
+    COUNT(*) AS events,
+    COUNTIF(event_name = 'purchase') AS purchases,
+    COUNT(DISTINCT user_key) AS users
+  FROM with_weeks
+  GROUP BY campaign, week_start, device_type, browser, weekday_iso_num, weekday_name
+)
+
+-- Final output: rename week to week_label (string), ordered by actual date
+SELECT
+  campaign,
+  FORMAT_DATE('%Y-%m-%d', week_start) AS week_label,
+  device_type,
+  browser,
+  weekday_iso_num,
+  weekday_name,
+  events,
+  purchases,
+  users
+FROM agg
+ORDER BY campaign, week_start, device_type, browser, weekday_iso_num;
